@@ -1,0 +1,5 @@
+# Linux / existing-platform runtime.
+# PyQt6 is the binding the original application imports.
+PyQt6>=6.6
+pulsectl>=24.0
+mido>=1.3.2
