@@ -31,6 +31,29 @@ except Exception:
 
 binaries = collect_dynamic_libs("av")
 
+# The frozen --smoke step uses QT_QPA_PLATFORM=offscreen. Collect the platform
+# plugins explicitly so that plugin is present even if the PySide6 hook keeps
+# only the native Windows platform plugin.
+def _qt_plugins():
+    try:
+        import PySide6
+    except Exception:
+        return []
+    base = os.path.dirname(PySide6.__file__)
+    roots = [os.path.join(base, "Qt", "plugins"), os.path.join(base, "plugins")]
+    found = []
+    for plugin_root in roots:
+        if not os.path.isdir(plugin_root):
+            continue
+        for kind in ("platforms", "styles", "imageformats", "iconengines"):
+            folder = os.path.join(plugin_root, kind)
+            if os.path.isdir(folder):
+                found.append((folder, os.path.join("PySide6", "qt-plugins", kind)))
+        break
+    return found
+
+datas += _qt_plugins()
+
 hiddenimports = [
     "mido.backends.rtmidi",
     "rtmidi",

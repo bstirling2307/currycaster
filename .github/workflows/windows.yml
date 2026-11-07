@@ -45,6 +45,9 @@ jobs:
       - name: Install Python packages
         run: python -m pip install -r requirements-windows.txt -r requirements-dev.txt "pyinstaller>=6.0"
       - name: Unit tests
+        env:
+          CURRYCASTER_QT: PySide6
+          QT_QPA_PLATFORM: offscreen
         run: python -m pytest -q
       - name: Build portable executable
         run: pyinstaller --noconfirm --clean windows\currycaster.spec
@@ -52,6 +55,7 @@ jobs:
         shell: pwsh
         run: |
           $env:QT_QPA_PLATFORM = "offscreen"
+          $env:CURRYCASTER_QT = "PySide6"
           & .\dist\Currycaster\Currycaster.exe --self-check
           $code = $LASTEXITCODE
           Write-Host "---- startup.log ----"
@@ -66,6 +70,7 @@ jobs:
         shell: pwsh
         run: |
           $env:QT_QPA_PLATFORM = "offscreen"
+          $env:CURRYCASTER_QT = "PySide6"
           & .\dist\Currycaster\Currycaster.exe --smoke
           $code = $LASTEXITCODE
           Write-Host "---- smoke-result.txt ----"
