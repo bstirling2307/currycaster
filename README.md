@@ -50,6 +50,16 @@ Currently tested with the RODE RØDECaster Pro II using the [RODECaster Pro II P
 echo "/path/to/audio.mp3" | nc 127.0.0.1 9876
 ```
 
+On Windows PowerShell:
+
+```powershell
+$client = New-Object System.Net.Sockets.TcpClient("127.0.0.1", 9876)
+$stream = $client.GetStream()
+$bytes = [Text.Encoding]::UTF8.GetBytes("C:\path\to\audio.mp3")
+$stream.Write($bytes, 0, $bytes.Length)
+$client.Close()
+```
+
 ### File Library
 - **Background indexing** - scans media folders without blocking UI
 - **Folder browser** - tree view of media directory
@@ -75,17 +85,31 @@ echo "/path/to/audio.mp3" | nc 127.0.0.1 9876
 ## Requirements
 
 - Python 3.10+
-- PyQt6
-- GStreamer with Python bindings
-- pulsectl (PulseAudio control)
+- PyQt6 on Linux (PySide6 on the Windows build; either binding works)
+- GStreamer with Python bindings on Linux
+- pulsectl (PulseAudio control) on Linux
 - mido (MIDI support)
-- PipeWire or PulseAudio
+- PipeWire or PulseAudio on Linux
+- On Windows 10/11 x64: PyAV, PortAudio (`sounddevice`), and `python-rtmidi`
+
+Linux audio routing is unchanged: GStreamer `playbin` / `pulsesink` and PulseAudio or PipeWire. The Windows port plays through shared-mode WASAPI endpoints and keeps the same players, carts, waveforms, MIDI learn, and TCP loader.
 
 ## Installation
 
+Linux:
+
 ```bash
-pip install PyQt6 pulsectl mido
+pip install -r requirements.txt
 ```
+
+Windows, from source:
+
+```powershell
+py -3 -m pip install -r requirements-windows.txt
+py -3 currycaster.py
+```
+
+Windows installers and a portable build are produced by `.github/workflows/windows.yml`. See [docs/WINDOWS.md](docs/WINDOWS.md) for installation, building, and the behaviors that differ from PulseAudio.
 
 ## Running
 
@@ -95,7 +119,7 @@ python currycaster.py
 
 ## Configuration
 
-On first run, config files are created in `~/.config/currycaster/`:
+On first run, config files are created in `~/.config/currycaster/` on Linux and in `%APPDATA%\currycaster` on Windows:
 - `audio_config.json` - Audio device routing (Program/Cue sinks)
 - `midi_config.json` - MIDI controller mappings
 - `library_index.json` - File library cache
@@ -156,4 +180,6 @@ Currycaster is designed for professional broadcast use with equipment like:
 
 ## License
 
-MIT License - See LICENSE file
+MIT License - See LICENSE file.
+
+Copyright (c) 2024 Adam Curry. The Windows playback and packaging in this fork are modifications of that program; the copyright notice and this permission notice stay with the source and with redistributed builds.

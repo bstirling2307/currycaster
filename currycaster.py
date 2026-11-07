@@ -1,24 +1,35 @@
 #!/usr/bin/env python3
+# Currycaster - podcast playout software
+# Copyright (c) 2024 Adam Curry
+# SPDX-License-Identifier: MIT
 import logging
-logging.basicConfig(filename='/home/adam/currycaster.log', level=logging.DEBUG, format='%(asctime)s %(message)s')
-print("DEBUG: Starting Broadcast System (v41.7 - IPC Thread Safety Fix)...")
-logging.info("Starting currycaster")
-import sys, subprocess, struct, json, os, time, gi, mido, pulsectl
-from pathlib import Path
-from PyQt6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton,
-                             QFileDialog, QLabel, QFrame, QSlider, QTreeView, QMenu,
-                             QLineEdit, QListWidget, QListWidgetItem, QProgressBar,
-                             QTabWidget, QGridLayout, QInputDialog, QColorDialog, QMainWindow,
-                             QFontDialog)
-from PyQt6.QtCore import (QTimer, Qt, pyqtSignal, QDir, QThread, QObject, QSortFilterProxyModel, QMimeData, QUrl, QTime)
-from PyQt6.QtGui import (QPainter, QColor, QPen, QAction, QFileSystemModel, QShortcut, QKeySequence, QDrag, QFont)
+import os
+import sys
 
-gi.require_version('Gst', '1.0')
-gi.require_version('GstPbutils', '1.0')
-from gi.repository import Gst, GObject, GstPbutils
+from cc import __version__
+from cc.paths import configure_logging, default_media_root, display_name, merge_config, user_config_dir
+
+configure_logging()
+print(f"DEBUG: Starting Broadcast System (v{__version__} - Windows WASAPI playout)...")
+logging.info("Starting currycaster %s", __version__)
+
+import json
+from cc.dnd import get_filepath_from_drop
+from cc.indexer import index_audio_files
+from cc.ipc import IpcServer
+from cc.qt_compat import (
+    QAction, QApplication, QColor, QColorDialog, QDrag, QFileDialog, QFileSystemModel,
+    QFont, QFontDialog, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QKeySequence,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QMimeData,
+    QObject, QPainter, QPen, QProgressBar, QPushButton, QShortcut, QSlider,
+    QSortFilterProxyModel, QTabWidget, QThread, QTime, QTimer, QTreeView, QUrl,
+    QVBoxLayout, QWidget, Qt, pyqtSignal,
+)
+from cc.timecode import format_player_time, reached_cue_out
+from cc.volume import get_log_volume
 
 # --- CONFIGURATION PATHS ---
-USER_CONFIG_DIR = os.path.join(os.path.expanduser("~"), ".config", "currycaster")
+USER_CONFIG_DIR = user_config_dir()
 os.makedirs(USER_CONFIG_DIR, exist_ok=True)
 MIDI_CONFIG_FILE = os.path.join(USER_CONFIG_DIR, "midi_config.json")
 AUDIO_CONFIG_FILE = os.path.join(USER_CONFIG_DIR, "audio_config.json")
@@ -26,20 +37,7 @@ LIBRARY_INDEX_FILE = os.path.join(USER_CONFIG_DIR, "library_index.json")
 CART_CONFIG_FILE = os.path.join(USER_CONFIG_DIR, "cart_config.json")
 WINDOW_LAYOUT_FILE = os.path.join(USER_CONFIG_DIR, "window_layout.json")
 EXPLORER_CONFIG_FILE = os.path.join(USER_CONFIG_DIR, "explorer_config.json")
-VALID_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.flac', '.ogg', '.aac', '.wma'}
-
-# --- GLOBAL HELPERS ---
-def get_filepath_from_drop(e):
-    if e.mimeData().hasUrls():
-        for url in e.mimeData().urls():
-            if url.isLocalFile(): return url.toLocalFile()
-    if e.mimeData().hasText():
-        return e.mimeData().text().replace("file://", "").strip()
-    return None
-
-def get_log_volume(linear_value):
-    """Converts 0-100 linear to 0.0-1.0 cubic gain."""
-    return (linear_value / 100.0) ** 3
+AUDIO_FILE_FILTER = "Audio (*.mp3 *.wav *.ogg *.flac *.m4a *.aac *.wma)"
 
 # --- Window State Manager ---
 class WindowStateManager:
@@ -49,18 +47,18 @@ class WindowStateManager:
     def load(self):
         if os.path.exists(WINDOW_LAYOUT_FILE):
             try:
-                with open(WINDOW_LAYOUT_FILE, 'r') as f: self.data = json.load(f)
-            except: pass
+                with open(WINDOW_LAYOUT_FILE, "r", encoding="utf-8") as f: self.data = json.load(f)
+            except Exception: pass
     def save(self):
         try:
-            with open(WINDOW_LAYOUT_FILE, 'w') as f: json.dump(self.data, f, indent=4)
-        except: pass
+            with open(WINDOW_LAYOUT_FILE, "w", encoding="utf-8") as f: json.dump(self.data, f, indent=4)
+        except Exception: pass
     def apply(self, widget, name):
         if name in self.data:
             g = self.data[name]
-            widget.move(g['x'], g['y']); widget.resize(g['w'], g['h'])
+            widget.move(g["x"], g["y"]); widget.resize(g["w"], g["h"])
     def record(self, widget, name):
-        self.data[name] = {'x': widget.x(), 'y': widget.y(), 'w': widget.width(), 'h': widget.height()}
+        self.data[name] = {"x": widget.x(), "y": widget.y(), "w": widget.width(), "h": widget.height()}
         self.save()
 
 window_manager = WindowStateManager()
@@ -71,57 +69,69 @@ class FileIndexerWorker(QThread):
     def __init__(self, root_path):
         super().__init__(); self.root_path = root_path
     def run(self):
-        db = []
-        try:
-            for root, dirs, files in os.walk(self.root_path):
-                if any(x in root for x in ["/.", "/found.", "$RECYCLE"]): continue
-                for file in files:
-                    if file.startswith('.') or os.path.splitext(file)[1].lower() not in VALID_EXTENSIONS: continue
-                    try:
-                        fp = os.path.join(root, file)
-                        db.append((file, fp, os.path.getmtime(fp)))
-                    except: pass
-        except: pass
-        db.sort(key=lambda x: x[2], reverse=True)
-        self.index_finished.emit(db)
+        self.index_finished.emit(index_audio_files(self.root_path))
 
 # --- 2. AUDIO ROUTER ---
 class AudioRouter:
     def __init__(self):
-        self.pulse = pulsectl.Pulse('currycaster-router')
-        self.active_players, self.active_cart_ids = [], []
+        self.pulse = None
+        self.active_players, self.active_cart_ids, self.active_carts = [], [], []
+        self._windows = sys.platform == "win32"
+        self.sinks = []
+        self.global_pgm_sink = None
+        self.global_cue_sink = None
+        if not self._windows:
+            try:
+                import pulsectl
+            except ImportError as exc:
+                raise RuntimeError("pulsectl is required on this platform. Install it with: pip install pulsectl") from exc
+            self.pulse = pulsectl.Pulse("currycaster-router")
         self.sinks = self.refresh_devices()
         self.global_pgm_sink = self.sinks[0].name if self.sinks else None
         self.global_cue_sink = self.sinks[0].name if self.sinks else None
         self.load_config()
         self.heartbeat = QTimer(); self.heartbeat.timeout.connect(self._heartbeat_check); self.heartbeat.start(30000)
     def _reconnect_pulse(self):
+        if self._windows: return
         try: self.pulse.close()
-        except: pass
+        except Exception: pass
         try:
-            self.pulse = pulsectl.Pulse('currycaster-router')
+            import pulsectl
+            self.pulse = pulsectl.Pulse("currycaster-router")
             logging.info("AudioRouter: reconnected to PulseAudio")
         except Exception as e:
             logging.error(f"AudioRouter: reconnect failed: {e}")
     def _heartbeat_check(self):
+        if self._windows:
+            try: self.sinks = self.refresh_devices()
+            except Exception as e: logging.warning(f"AudioRouter: device refresh failed: {e}")
+            return
         try:
             self.pulse.sink_list()
         except Exception as e:
             logging.warning(f"AudioRouter: heartbeat failed ({e}), reconnecting...")
             self._reconnect_pulse()
     def refresh_devices(self):
+        if self._windows:
+            try:
+                from cc.devices import list_output_devices
+                self.sinks = list_output_devices()
+            except Exception as e:
+                logging.warning(f"AudioRouter: refresh_devices failed ({e})")
+                self.sinks = []
+            return self.sinks
         try:
             self.sinks = self.pulse.sink_list()
         except Exception as e:
             logging.warning(f"AudioRouter: refresh_devices failed ({e}), reconnecting...")
             self._reconnect_pulse()
             try: self.sinks = self.pulse.sink_list()
-            except: self.sinks = []
+            except Exception: self.sinks = []
         return self.sinks
     def load_config(self):
         if not os.path.exists(AUDIO_CONFIG_FILE): return
         try:
-            with open(AUDIO_CONFIG_FILE, 'r') as f:
+            with open(AUDIO_CONFIG_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
                 an = [s.name for s in self.sinks]
                 if d.get("program_sink") in an: self.global_pgm_sink = d["program_sink"]
@@ -129,7 +139,7 @@ class AudioRouter:
         except Exception as e: logging.warning(f"AudioRouter: load_config failed: {e}")
     def save_config(self):
         try:
-            with open(AUDIO_CONFIG_FILE, 'w') as f:
+            with open(AUDIO_CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump({"program_sink": self.global_pgm_sink, "cue_sink": self.global_cue_sink}, f, indent=4)
         except Exception as e: logging.warning(f"AudioRouter: save_config failed: {e}")
     def set_program_device(self, name): self.global_pgm_sink = name; self.save_config(); self.move_all_streams()
@@ -138,15 +148,31 @@ class AudioRouter:
         if p not in self.active_players: self.active_players.append(p)
     def register_cart_id(self, cid):
         if cid not in self.active_cart_ids: self.active_cart_ids.append(cid)
+    def register_cart(self, cart):
+        self.register_cart_id(cart.uid)
+        if cart not in self.active_carts: self.active_carts.append(cart)
     def move_all_streams(self):
         for p in self.active_players: self.route_stream(f"Currycaster_Player_{p.player_id}", p.pfl)
         for cid in self.active_cart_ids: self.route_stream(cid, False)
+    def _route_wasapi(self, app_id, is_cue):
+        target = self.global_cue_sink if is_cue else self.global_pgm_sink
+        for player in self.active_players:
+            if f"Currycaster_Player_{player.player_id}" == app_id:
+                player.apply_output_device(target)
+                return
+        for cart in self.active_carts:
+            if getattr(cart, "uid", None) == app_id:
+                cart.apply_output_device(target)
+                return
     def route_stream(self, app_id, is_cue, retries=8):
+        if self._windows:
+            self._route_wasapi(app_id, is_cue)
+            return
         target = self.global_cue_sink if is_cue else self.global_pgm_sink
         def attempt(rem, reconnected=False):
             try:
                 t_snk = next((s for s in self.pulse.sink_list() if s.name == target), None)
-                t_str = next((i for i in self.pulse.sink_input_list() if i.proplist.get('application.name') == app_id), None)
+                t_str = next((i for i in self.pulse.sink_input_list() if i.proplist.get("application.name") == app_id), None)
                 if t_str and t_snk and t_str.sink != t_snk.index:
                     self.pulse.sink_input_move(t_str.index, t_snk.index)
                 elif rem > 0: QTimer.singleShot(150, lambda: attempt(rem - 1))
@@ -170,16 +196,21 @@ class MidiWorker(QThread):
         super().__init__(); self.running = True; self.port_name = None
     def run(self):
         try:
-            av = mido.get_input_names()
+            import mido
+            from cc.midi_probe import probe_midi_input_names
+            if sys.platform == "win32":
+                try: mido.set_backend("mido.backends.rtmidi")
+                except Exception as exc: logging.warning("MIDI backend: %s", exc)
+            av, _error = probe_midi_input_names()
             self.port_name = next((n for n in av if any(x in n.lower() for x in ["nano", "kontrol"])), av[0] if av else None)
             if not self.port_name: return
             with mido.open_input(self.port_name) as port:
                 while self.running:
                     for m in port.iter_pending():
-                        if m.type == 'control_change': self.midi_signal.emit('cc', m.channel, m.control, m.value)
-                        elif m.type == 'note_on': self.midi_signal.emit('note', m.channel, m.note, m.velocity)
+                        if m.type == "control_change": self.midi_signal.emit("cc", m.channel, m.control, m.value)
+                        elif m.type == "note_on": self.midi_signal.emit("note", m.channel, m.note, m.velocity)
                     self.msleep(5)
-        except: pass
+        except Exception: pass
     def stop(self): self.running = False; self.wait()
 
 class MidiMapper(QObject):
@@ -189,12 +220,12 @@ class MidiMapper(QObject):
     def load(self):
         if os.path.exists(MIDI_CONFIG_FILE):
             try:
-                with open(MIDI_CONFIG_FILE, 'r') as f: self.l_map = json.load(f)
-            except: pass
+                with open(MIDI_CONFIG_FILE, "r", encoding="utf-8") as f: self.l_map = json.load(f)
+            except Exception: pass
     def save(self):
         try:
-            with open(MIDI_CONFIG_FILE, 'w') as f: json.dump(self.l_map, f, indent=4)
-        except: pass
+            with open(MIDI_CONFIG_FILE, "w", encoding="utf-8") as f: json.dump(self.l_map, f, indent=4)
+        except Exception: pass
     def register(self, uid, cb):
         self.registry[uid] = cb
         if uid in self.l_map: self.r_map[self.l_map[uid]] = cb
@@ -206,7 +237,7 @@ class MidiMapper(QObject):
             return
         if uk in self.r_map:
             try: self.r_map[uk](val)
-            except: pass
+            except Exception: pass
     def start_learning(self, uid): self.learning_uid = uid
 
 # --- 4. UI COMPONENTS ---
@@ -248,18 +279,12 @@ class WaveformWidget(QFrame):
         self.waveform_data, self.zoom_level, self.view_offset = [], 1.0, 0.0
         self.cue_in, self.cue_out = 0.0, 1.0
         self.cue_points_changed.emit(0.0, 1.0)
-        cmd = ['ffmpeg', '-i', file_path, '-f', 's16le', '-ac', '1', '-acodec', 'pcm_s16le', '-ar', '200', '-vn', '-']
         try:
-            result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            if result.stdout:
-                total_samples = len(result.stdout) // 2
-                fmt = f"<{total_samples}h"
-                samples = struct.unpack(fmt, result.stdout)
-                abs_values = [abs(s) for s in samples]
-                max_val = max(abs_values) if abs_values else 0
-                self.waveform_data = [s / max_val if max_val > 0 else 0 for s in abs_values]
-                self.update()
-        except: pass
+            from cc.waveform import load_waveform_peaks
+            self.waveform_data = load_waveform_peaks(file_path)
+            self.update()
+        except Exception:
+            logging.exception("waveform failed")
     def clear_waveform(self): self.waveform_data, self.position_percent = [], 0.0; self.update()
     def set_position(self, percent): self.position_percent = percent; self.update()
     def set_start_point(self, percent): self.cue_in = max(0.0, min(percent, self.cue_out)); self.cue_points_changed.emit(self.cue_in, self.cue_out); self.update()
@@ -326,7 +351,8 @@ class PlayerModule(QWidget):
         self.pfl, self.playing, self.dur = False, False, 0
         self.c_in, self.c_out, self.seek_req = 0.0, 1.0, True
         self.show_remaining = True
-        self.ar.register_player(self); Gst.init(None); self.pipeline = None
+        self.clip = None
+        self.ar.register_player(self)
         self.setStyleSheet("border-right: 1px solid #333; background: #1a1a1a;")
         self.setFixedWidth(240)
         lay = QHBoxLayout(self); lay.setContentsMargins(2,2,2,2)
@@ -352,102 +378,119 @@ class PlayerModule(QWidget):
         l_lay.addLayout(ctrls); lay.addWidget(l_cnt); lay.addWidget(self.vol)
         self.tmr = QTimer(); self.tmr.timeout.connect(self.update_ui)
     def dragEnterEvent(self, event): (event.accept() if get_filepath_from_drop(event) else event.ignore())
-    def dropEvent(self, event): 
+    def dropEvent(self, event):
         path = get_filepath_from_drop(event)
         if path:
             self.load_track(path)
             event.accept()
     def set_v_internal(self, v): self.vol.setValue(v)
-    def set_v_engine(self, v): (self.pipeline and self.pipeline.set_property("volume", get_log_volume(v)))
+    def set_v_engine(self, v):
+        if self.clip: self.clip.set_volume(get_log_volume(v))
+    def apply_output_device(self, device_name):
+        if self.clip: self.clip.set_device(device_name)
     def toggle_pfl(self):
         self.pfl = not self.pfl; self.lbl_s.setStyleSheet(f"color:{'#ffa500' if self.pfl else '#eee'}; font-size:12px; font-weight:bold; border:{'1px solid #ffa500' if self.pfl else 'none'};")
         self.ar.route_player(self.player_id, self.pfl)
     def toggle_time_mode(self): self.show_remaining = not self.show_remaining; self.update_ui()
-    def upd_clip(self, s, e): self.c_in, self.c_out = s, e; (not self.playing) and (setattr(self, 'seek_req', True) or self.wf.set_position(s))
+    def upd_clip(self, s, e): self.c_in, self.c_out = s, e; (not self.playing) and (setattr(self, "seek_req", True) or self.wf.set_position(s))
     def load_dialog(self):
-        f, _ = QFileDialog.getOpenFileName(self, "Load Audio", "", "Audio (*.mp3 *.wav *.ogg *.flac)")
+        f, _ = QFileDialog.getOpenFileName(self, "Load Audio", "", AUDIO_FILE_FILTER)
         if f: self.load_track(f)
+    def _release_clip(self):
+        self.tmr.stop()
+        self.playing = False
+        self.b_play.setText("PLAY")
+        if self.clip:
+            try: self.clip.close()
+            except Exception: logging.exception("clip close")
+            self.clip = None
     def load_track(self, path):
-        self.stop_audio(); self.lbl_s.setText(os.path.basename(path)); self.wf.load_waveform_from_file(path); self.dur = 0
+        self._release_clip(); self.lbl_s.setText(os.path.basename(path)); self.wf.load_waveform_from_file(path); self.dur = 0
         try:
-            disc = GstPbutils.Discoverer.new(10 * Gst.SECOND)
-            info = disc.discover_uri(Path(path).as_uri())
-            self.dur = info.get_duration(); self.update_ui_label(0); self.wf.set_position(0.0)
-        except Exception as e: print(f"Discoverer error: {e}")
-        self.pipeline = Gst.ElementFactory.make("playbin", None); self.pipeline.set_property("uri", Path(path).as_uri())
-        sink = Gst.ElementFactory.make("pulsesink", None)
-        props = Gst.Structure.new_empty("props"); props.set_value("application.name", f"Currycaster_Player_{self.player_id}"); sink.set_property("stream-properties", props)
-        target = self.ar.global_cue_sink if self.pfl else self.ar.global_pgm_sink
-        if target: sink.set_property("device", target)
-        self.pipeline.set_property("audio-sink", sink); self.pipeline.set_property("volume", get_log_volume(self.vol.value()))
-        self.pipeline.set_state(Gst.State.PAUSED); self.playing = False; self.seek_req = True
+            from cc.playback import open_clip
+            target = self.ar.global_cue_sink if self.pfl else self.ar.global_pgm_sink
+            self.clip = open_clip(
+                path,
+                app_name=f"Currycaster_Player_{self.player_id}",
+                device=target,
+                volume=get_log_volume(self.vol.value()),
+                on_eos=None,
+                start_paused=True,
+            )
+            dur = self.clip.query_duration_ns()
+            self.dur = dur or 0
+            self.update_ui_label(0); self.wf.set_position(0.0)
+        except Exception as e:
+            print(f"Load error: {e}")
+            logging.exception("load_track failed")
+            self.clip = None
+        self.playing = False; self.seek_req = True
     def toggle_play(self):
-        if not self.pipeline: return
-        if self.playing: 
-            self.pipeline.set_state(Gst.State.PAUSED)
+        if not self.clip: return
+        if self.playing:
+            self.clip.pause()
             self.tmr.stop()
             self.playing = False
             self.b_play.setText("PLAY")
         else:
-            if self.seek_req: self.pipeline.set_state(Gst.State.PAUSED); self.enforce_seek()
-            self.pipeline.set_state(Gst.State.PLAYING); self.tmr.start(40); self.playing = True; self.b_play.setText("PAUSE")
+            if self.seek_req: self.clip.pause(); self.enforce_seek()
+            self.clip.play(); self.tmr.start(40); self.playing = True; self.b_play.setText("PAUSE")
             self.ar.route_player(self.player_id, self.pfl)
     def enforce_seek(self):
-        s, d = self.pipeline.query_duration(Gst.Format.TIME)
-        if s: self.dur = d
-        if self.dur > 0 and self.c_in > 0: self.pipeline.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, int(self.c_in * self.dur))
+        if not self.clip: return
+        d = self.clip.query_duration_ns()
+        if d: self.dur = d
+        if self.dur > 0 and self.c_in > 0: self.clip.seek_ns(int(self.c_in * self.dur))
         self.seek_req = False
     def stop_audio(self):
-        if not self.pipeline: return
-        if self.playing: 
-            self.pipeline.set_state(Gst.State.PAUSED)
+        if not self.clip: return
+        if self.playing:
+            self.clip.pause()
             self.tmr.stop()
             self.playing = False
             self.b_play.setText("PLAY")
             self.enforce_seek(); self.wf.set_position(self.c_in); self.update_ui_label(int(self.c_in * self.dur))
         else:
-            if self.dur > 0: self.pipeline.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, 0)
+            if self.dur > 0: self.clip.seek_ns(0)
             self.wf.set_position(0.0); self.update_ui_label(0)
     def dump_track(self):
-        if self.pipeline: self.pipeline.set_state(Gst.State.NULL)
-        self.tmr.stop()
-        self.pipeline = None
+        self._release_clip()
         self.lbl_t.setText("00:00")
         self.lbl_s.setText(f"Player {self.player_id}")
         self.wf.clear_waveform()
+        self.dur = 0
     def seek_audio(self, p):
-        if self.pipeline and self.dur > 0:
-            if self.playing: self.pipeline.seek_simple(Gst.Format.TIME, Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT, int(p * self.dur))
+        if self.clip and self.dur > 0:
+            if self.playing: self.clip.seek_ns(int(p * self.dur))
             else: self.c_in, self.seek_req = p, True
         self.wf.set_position(p)
     def update_ui(self):
-        if not self.pipeline: return
-        sd, d = self.pipeline.query_duration(Gst.Format.TIME); sp, p = self.pipeline.query_position(Gst.Format.TIME)
-        if sd: self.dur = d
-        if sp and self.dur > 0:
+        if not self.clip: return
+        d = self.clip.query_duration_ns(); p = self.clip.query_position_ns()
+        if d: self.dur = d
+        if p is not None and self.dur > 0:
             if self.seek_req and p < int(self.c_in * self.dur): return
             self.wf.set_position(p / self.dur); self.update_ui_label(p)
-            if p >= (int(self.c_out * self.dur) if self.c_out < 1.0 else self.dur): self.stop_audio()
+            if reached_cue_out(p, self.dur, self.c_out): self.stop_audio()
     def update_ui_label(self, p):
         if not self.dur: return
-        end_p = int(self.c_out * self.dur) if self.c_out < 1.0 else self.dur
-        ts = int((end_p - p if self.show_remaining else p) / 1e9)
-        prefix = '-' if self.show_remaining else ''
-        self.lbl_t.setText(f"{prefix}{ts//60:02}:{ts%60:02}")
+        self.lbl_t.setText(format_player_time(p, self.dur, self.c_out, self.show_remaining))
         self.lbl_t.setStyleSheet(f"font-size:24px; font-weight:bold; color:{'#ff5555' if self.show_remaining else '#00bcd4'}; font-family:monospace;")
     def open_menu(self):
         m = QMenu(self); m.addAction("Toggle PFL", self.toggle_pfl); pm, cm = m.addMenu("Program Out"), m.addMenu("Cue Out")
-        for s in self.ar.refresh_devices(): pm.addAction(s.description, lambda n=s.name: self.ar.set_program_device(n)); cm.addAction(s.description, lambda n=s.name: self.ar.set_cue_device(n))
+        for s in self.ar.refresh_devices():
+            pm.addAction(s.description, lambda n=s.name: self.ar.set_program_device(n))
+            cm.addAction(s.description, lambda n=s.name: self.ar.set_cue_device(n))
         m.exec(self.lbl_s.mapToGlobal(self.lbl_s.rect().center()))
-    def is_active(self): return self.pipeline is not None
+    def is_active(self): return self.clip is not None
 
 # --- 7. CART BUTTON ---
 class CartButton(QFrame):
     playing_triggered, finished_triggered = pyqtSignal(object), pyqtSignal(object)
     def __init__(self, ar, parent=None):
         super().__init__(parent); self.setAcceptDrops(True); self.setFrameShape(QFrame.Shape.StyledPanel); self.setMinimumHeight(100)
-        self.ar, self.file, self.pipeline, self.playing = ar, None, None, False
-        self.uid = f"Currycaster_Cart_{id(self)}"; self.ar.register_cart_id(self.uid)
+        self.ar, self.file, self.clip, self.playing = ar, None, None, False
+        self.uid = f"Currycaster_Cart_{id(self)}"; self.ar.register_cart(self)
         self.c_name, self.c_color = "", "#333333"
         lay = QHBoxLayout(self); lay.setContentsMargins(0,0,0,0); lay.setSpacing(0)
         self.btn = QPushButton("EMPTY"); self.btn.setSizePolicy(self.btn.sizePolicy().Policy.Expanding, self.btn.sizePolicy().Policy.Expanding)
@@ -466,43 +509,56 @@ class CartButton(QFrame):
         c = QColorDialog.getColor(initial=QColor(self.c_color), parent=self, title="Cart Color")
         if c.isValid(): self.c_color = c.name(); self.upd_ui()
     def clear_cart(self): self.stop(); self.file, self.c_name, self.c_color = None, "", "#333333"; self.upd_ui()
-    
-    def wheelEvent(self, event): 
+    def wheelEvent(self, event):
         cur_v = self.vol.value()
         step = 5 if event.angleDelta().y() > 0 else -5
         self.vol.setValue(max(0, min(100, cur_v + step)))
-        
-    def load_file(self, p, n=None, c=None, v=100): 
+    def load_file(self, p, n=None, c=None, v=100):
         self.file = p
         self.c_name = n or os.path.basename(p)
         self.c_color = c or self.c_color
         self.vol.setValue(v)
         self.upd_ui()
-        
     def upd_ui(self):
         self.btn.setText(self.c_name if self.file else "EMPTY")
-        color = self.c_color if self.file else '#222'
-        text_color = 'white' if self.file else '#555'
-        border = '2px solid #00ff00' if self.playing else 'none'
+        color = self.c_color if self.file else "#222"
+        text_color = "white" if self.file else "#555"
+        border = "2px solid #00ff00" if self.playing else "none"
         self.btn.setStyleSheet(f"background:{color}; color:{text_color}; font-weight:bold; font-size:11px; border:{border};")
-
     def toggle_play(self): self.stop() if self.playing else self.play()
+    def apply_output_device(self, device_name):
+        if self.clip: self.clip.set_device(device_name)
     def play(self):
         if not self.file: return
-        self.stop(); self.pipeline = Gst.ElementFactory.make("playbin", None); self.pipeline.set_property("uri", Path(self.file).as_uri())
-        sink = Gst.ElementFactory.make("pulsesink", None); props = Gst.Structure.new_empty("props"); props.set_value("application.name", self.uid); sink.set_property("stream-properties", props)
-        if self.ar.global_pgm_sink: sink.set_property("device", self.ar.global_pgm_sink)
-        self.pipeline.set_property("audio-sink", sink); self.pipeline.set_property("volume", get_log_volume(self.vol.value()))
-        bus = self.pipeline.get_bus(); bus.add_signal_watch(); bus.connect("message::eos", lambda b,m: self.stop())
-        self.pipeline.set_state(Gst.State.PLAYING); self.playing = True; self.upd_ui(); self.playing_triggered.emit(self)
+        self.stop()
+        try:
+            from cc.playback import open_clip
+            self.clip = open_clip(
+                self.file,
+                app_name=self.uid,
+                device=self.ar.global_pgm_sink,
+                volume=get_log_volume(self.vol.value()),
+                on_eos=self.stop,
+                start_paused=False,
+            )
+        except Exception as e:
+            print(f"Cart load error: {e}")
+            logging.exception("cart play failed")
+            self.clip = None
+            return
+        self.playing = True; self.upd_ui(); self.playing_triggered.emit(self)
     def stop(self):
-        if self.pipeline: self.pipeline.set_state(Gst.State.NULL); self.pipeline = None
+        if self.clip:
+            try: self.clip.close()
+            except Exception: logging.exception("cart stop")
+            self.clip = None
         self.playing = False; self.upd_ui(); self.finished_triggered.emit(self)
-    def upd_vol(self): (self.pipeline and self.pipeline.set_property("volume", get_log_volume(self.vol.value())))
+    def upd_vol(self):
+        if self.clip: self.clip.set_volume(get_log_volume(self.vol.value()))
     def get_rem_ns(self):
-        if self.pipeline:
-            s1, p = self.pipeline.query_position(Gst.Format.TIME); s2, d = self.pipeline.query_duration(Gst.Format.TIME)
-            if s1 and s2: return d - p
+        if self.clip:
+            position = self.clip.query_position_ns(); duration = self.clip.query_duration_ns()
+            if position is not None and duration: return duration - position
         return 0
     def get_data(self): return {"path": self.file, "name": self.c_name, "color": self.c_color, "vol": self.vol.value()}
 
@@ -510,9 +566,7 @@ class CartButton(QFrame):
 class JunkFileFilter(QSortFilterProxyModel):
     def filterAcceptsRow(self, r, p):
         idx = self.sourceModel().index(r, 0, p); fn = self.sourceModel().fileName(idx)
-        return not any(fn.startswith(x) for x in ['.', 'found.']) and fn not in ["$RECYCLE.BIN", "Recovery"]
-
-DEFAULT_MEDIA_ROOT = "/run/media/adam/NO AGENDA"
+        return not any(fn.startswith(x) for x in [".", "found."]) and fn not in ["$RECYCLE.BIN", "Recovery", "System Volume Information"]
 
 class FileExplorerWindow(QWidget):
     file_selected = pyqtSignal(str)
@@ -538,25 +592,30 @@ class FileExplorerWindow(QWidget):
         self.load_cache(); self.load_font_config(); QTimer.singleShot(1000, self.start_indexing)
         self.search_timer = QTimer(self); self.search_timer.setSingleShot(True); self.search_timer.timeout.connect(self.perform_search); self.current_query = ""
         self.update_title()
-    def load_root_path(self):
+    def _read_explorer(self):
         if os.path.exists(EXPLORER_CONFIG_FILE):
             try:
-                with open(EXPLORER_CONFIG_FILE, 'r') as f:
-                    d = json.load(f)
-                    path = d.get("root_path", DEFAULT_MEDIA_ROOT)
-                    if os.path.isdir(path): return path
-            except: pass
-        return DEFAULT_MEDIA_ROOT
+                with open(EXPLORER_CONFIG_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict): return data
+            except Exception: pass
+        return {}
+    def _write_explorer(self, data):
+        with open(EXPLORER_CONFIG_FILE, "w", encoding="utf-8") as f: json.dump(data, f, indent=4)
+    def load_root_path(self):
+        data = self._read_explorer()
+        fallback = default_media_root()
+        path = data.get("root_path", fallback)
+        if path and os.path.isdir(path): return path
+        if os.path.isdir(fallback): return fallback
+        # Linux keeps the historical show-drive path even while it is unmounted.
+        if sys.platform != "win32": return fallback
+        return os.path.expanduser("~")
     def save_root_path(self):
-        try:
-            with open(EXPLORER_CONFIG_FILE, 'r') as f: d = json.load(f)
-        except: d = {}
-        d["root_path"] = self.root
-        try:
-            with open(EXPLORER_CONFIG_FILE, 'w') as f: json.dump(d, f, indent=4)
-        except: pass
+        self._write_explorer(merge_config(self._read_explorer(), {"root_path": self.root}))
     def select_root_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select Root Folder", self.root)
+        start = self.root if os.path.isdir(self.root) else os.path.expanduser("~")
+        folder = QFileDialog.getExistingDirectory(self, "Select Root Folder", start)
         if folder and os.path.isdir(folder):
             self.root = folder
             self.save_root_path()
@@ -566,22 +625,20 @@ class FileExplorerWindow(QWidget):
             QTimer.singleShot(100, self.start_indexing)
             self.update_title()
     def update_title(self):
-        short = self.root.split("/")[-1] if self.root else "Library"
-        self.setWindowTitle(f"Library ({short})")
+        self.setWindowTitle(f"Library ({display_name(self.root)})")
     def load_cache(self):
         if os.path.exists(LIBRARY_INDEX_FILE):
             try:
-                with open(LIBRARY_INDEX_FILE, 'r') as f: self.db = json.load(f)
-            except: pass
+                with open(LIBRARY_INDEX_FILE, "r", encoding="utf-8") as f: self.db = json.load(f)
+            except Exception: pass
     def load_font_config(self):
-        if os.path.exists(EXPLORER_CONFIG_FILE):
-            try:
-                with open(EXPLORER_CONFIG_FILE, 'r') as f:
-                    d = json.load(f); self.font_family, self.font_size = d.get("family", "Sans Serif"), d.get("size", 10)
-            except: pass
+        data = self._read_explorer()
+        self.font_family, self.font_size = data.get("family", "Sans Serif"), data.get("size", 10)
         self.apply_font()
     def save_font_config(self):
-        with open(EXPLORER_CONFIG_FILE, 'w') as f: json.dump({"family": self.font_family, "size": self.font_size}, f)
+        self._write_explorer(merge_config(self._read_explorer(), {
+            "family": self.font_family, "size": self.font_size, "root_path": self.root,
+        }))
     def choose_font(self):
         f, ok = QFontDialog.getFont(QFont(self.font_family, self.font_size), self, "Select Library Font")
         if ok: self.font_family, self.font_size = f.family(), f.pointSize(); self.apply_font(); self.save_font_config()
@@ -598,14 +655,15 @@ class FileExplorerWindow(QWidget):
         self.worker.index_finished.connect(self.on_idx_fin); self.worker.start()
     def on_idx_fin(self, db):
         self.db = db; self.btn_refresh.setText("Re-Index"); self.progress.setVisible(False)
-        with open(LIBRARY_INDEX_FILE, 'w') as f: json.dump(db, f)
+        with open(LIBRARY_INDEX_FILE, "w", encoding="utf-8") as f: json.dump(db, f)
     def on_search(self, t): self.current_query = t; self.search_timer.start(300)
     def perform_search(self):
         q = self.current_query.strip().lower()
         if not q: self.tr.setVisible(True); self.rl.setVisible(False); return
         self.tr.setVisible(False); self.rl.setVisible(True); self.rl.clear()
         for f, p, m in self.db:
-            if all(x in f.lower() for x in q.split()): item = QListWidgetItem(f); item.setData(Qt.ItemDataRole.UserRole, p); self.rl.addItem(item)
+            if all(x in f.lower() for x in q.split()):
+                item = QListWidgetItem(f); item.setData(Qt.ItemDataRole.UserRole, p); self.rl.addItem(item)
     def toggle_focus(self):
         if self.is_focused: self.tr.setRootIndex(self.pm.mapFromSource(self.sm.index(self.root))); self.is_focused, self.btn_focus.setText = False, "Focus on Folder"
         else:
@@ -647,17 +705,17 @@ class CartWallWindow(QMainWindow):
     def load(self):
         if os.path.exists(CART_CONFIG_FILE):
             try:
-                with open(CART_CONFIG_FILE, 'r') as f:
+                with open(CART_CONFIG_FILE, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     self.last_cart_dir = data.get("last_dir", USER_CONFIG_DIR)
                     lp = data.get("last_set")
                     if lp and os.path.exists(lp):
-                        with open(lp, 'r') as j:
+                        with open(lp, "r", encoding="utf-8") as j:
                             st = json.load(j)
                             for i, d in enumerate(st.get("carts", [])):
                                 if i < len(self.carts) and d.get("path"): self.carts[i].load_file(d["path"], d.get("name"), d.get("color"), d.get("vol"))
                         self.current_file = lp
-            except: pass
+            except Exception: pass
     def save_current(self): self.save_to_file(self.current_file) if self.current_file else self.save_as()
     def save_as(self):
         file, _ = QFileDialog.getSaveFileName(self, "Save Cartwall", self.last_cart_dir, "JSON (*.json)")
@@ -671,18 +729,23 @@ class CartWallWindow(QMainWindow):
             self.load_from_file(file); self.current_file = file; self.update_last_set(file)
     def save_to_file(self, file_path):
         data = {"carts": [cart.get_data() for cart in self.carts]}
-        with open(file_path, 'w') as f: json.dump(data, f, indent=4)
+        with open(file_path, "w", encoding="utf-8") as f: json.dump(data, f, indent=4)
     def load_from_file(self, file_path):
         try:
-            with open(file_path, 'r') as f:
+            with open(file_path, "r", encoding="utf-8") as f:
                 st = json.load(f); [c.clear_cart() for c in self.carts]
                 for i, d in enumerate(st.get("carts", [])):
                     if i < len(self.carts) and d.get("path"): self.carts[i].load_file(d["path"], d.get("name"), d.get("color"), d.get("vol"))
-        except: pass
+        except Exception: pass
     def update_last_set(self, file_path):
-        with open(CART_CONFIG_FILE, 'w') as f:
+        with open(CART_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump({"last_set": file_path, "last_dir": self.last_cart_dir}, f, indent=4)
-    def closeEvent(self, e): window_manager.record(self, "cart_window"); super().closeEvent(e)
+    def closeEvent(self, e):
+        window_manager.record(self, "cart_window")
+        for cart in self.carts:
+            try: cart.stop()
+            except Exception: logging.exception("cart close")
+        super().closeEvent(e)
 
 # --- 10. MAIN WINDOW ---
 class MainWindow(QWidget):
@@ -691,54 +754,135 @@ class MainWindow(QWidget):
         self.ar, self.mm = ar, MidiMapper(); self.mw = MidiWorker(); self.mw.midi_signal.connect(self.mm.handle); self.mw.start()
         lay = QHBoxLayout(self); lay.setSpacing(0); lay.setContentsMargins(0,0,0,0); self.players = [PlayerModule(i, self.mm, ar) for i in range(1,9)]
         for p in self.players: lay.addWidget(p)
-    def load_auto(self, path): 
+    def load_auto(self, path):
         logging.info(f"load_auto called with: {path}")
         (next((p for p in self.players if not p.is_active()), self.players[0])).load_track(path)
-    def closeEvent(self, e): window_manager.record(self, "player_window"); self.mw.stop(); super().closeEvent(e)
+    def closeEvent(self, e):
+        window_manager.record(self, "player_window")
+        for player in self.players:
+            try: player._release_clip()
+            except Exception: logging.exception("player close")
+        self.mw.stop()
+        super().closeEvent(e)
 
-import socket
-import threading
+def _configure_windows_runtime():
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("com.currycaster.broadcast")
+    except Exception:
+        logging.exception("AppUserModelID")
+    try:
+        import mido
+        mido.set_backend("mido.backends.rtmidi")
+    except Exception:
+        logging.warning("Windows MIDI backend is not available", exc_info=True)
 
-class IpcServer(QObject):
-    file_received = pyqtSignal(str)
+def _missing_windows_modules():
+    missing = []
+    for module_name in ("av", "sounddevice", "mido"):
+        try:
+            __import__(module_name)
+        except Exception:
+            missing.append(module_name)
+    return missing
 
-    def __init__(self, load_func):
-        super().__init__()
-        self.file_received.connect(load_func)
-        self.server_socket = None
-        self.running = False
+def _write_result(name, text):
+    try:
+        os.makedirs(USER_CONFIG_DIR, exist_ok=True)
+        with open(os.path.join(USER_CONFIG_DIR, name), "w", encoding="utf-8") as handle:
+            handle.write(text)
+    except OSError:
+        logging.exception("could not write %s", name)
 
-    def start(self):
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind(('127.0.0.1', 9876))
-        self.server_socket.listen(5)
-        self.running = True
-        thread = threading.Thread(target=self._accept_loop, daemon=True)
-        thread.start()
-        logging.info("IPC Server listening on port 9876")
+def run_smoke():
+    notes = []
+    code = 1
+    try:
+        if sys.platform != "win32":
+            from cc.playback_gst import ensure_gst
+            ensure_gst()
+        app = QApplication.instance() or QApplication(sys.argv)
+        if hasattr(app, "setDesktopFileName"):
+            app.setDesktopFileName("currycaster")
+        router = AudioRouter()
+        window = MainWindow(router)
+        carts = CartWallWindow(router)
+        library = FileExplorerWindow()
+        window.show(); carts.show(); library.show()
+        app.processEvents()
+        from cc.tone import write_sine_wav
+        wav_path = os.path.join(USER_CONFIG_DIR, "smoke-tone.wav")
+        write_sine_wav(wav_path, seconds=1.0)
+        window.players[0].load_track(wav_path)
+        app.processEvents()
+        if not window.players[0].is_active():
+            raise RuntimeError("player did not load the smoke-test tone")
+        if window.players[0].dur <= 0:
+            raise RuntimeError("player duration was not reported")
+        notes.append(f"loaded duration_ns={window.players[0].dur}")
+        notes.append(f"program_sink={router.global_pgm_sink}")
+        notes.append(f"players={len(window.players)} carts={len(carts.carts)}")
+        window.close(); carts.close(); library.close()
+        app.processEvents()
+        result = "ok\n" + "\n".join(notes) + "\n"
+        code = 0
+    except Exception as exc:
+        logging.exception("smoke failed")
+        result = f"fail: {exc}\n" + "\n".join(notes) + "\n"
+        code = 1
+    print(result, end="")
+    _write_result("smoke-result.txt", result)
+    return code
 
-    def _accept_loop(self):
-        while self.running:
-            try:
-                client_socket, addr = self.server_socket.accept()
-                data = client_socket.recv(4096).decode('utf-8').strip()
-                if data:
-                    logging.info(f"IPC received: {data}")
-                    self.file_received.emit(data)
-                client_socket.close()
-            except Exception as e:
-                logging.error(f"IPC accept error: {e}")
+def run_app():
+    if sys.platform == "win32":
+        _configure_windows_runtime()
+        missing = _missing_windows_modules()
+        if missing and not getattr(sys, "frozen", False):
+            print("Missing Python packages: " + ", ".join(missing))
+            print("Install them with: python -m pip install -r requirements-windows.txt")
+            return 1
+    else:
+        try:
+            from cc.playback_gst import ensure_gst
+            ensure_gst()
+        except Exception as exc:
+            logging.exception("GStreamer init failed")
+            print(f"GStreamer is required on this platform: {exc}")
+            return 1
+    app = QApplication(sys.argv)
+    if hasattr(app, "setDesktopFileName"):
+        app.setDesktopFileName("currycaster")
+    router = AudioRouter()
+    window = MainWindow(router)
+    window.show()
+    carts = CartWallWindow(router)
+    carts.show()
+    library = FileExplorerWindow()
+    library.show()
+    library.file_selected.connect(window.load_auto)
+    ipc_server = IpcServer(window.load_auto)
+    try:
+        ipc_server.start()
+    except Exception:
+        logging.exception("IPC Server failed to listen on port 9876")
+    code = app.exec()
+    try:
+        ipc_server.stop()
+    except Exception:
+        logging.exception("IPC stop failed")
+    return code
 
-    def stop(self):
-        self.running = False
-        if self.server_socket:
-            self.server_socket.close()
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if "--self-check" in args:
+        from cc.selfcheck import run_self_check
+        return run_self_check()
+    if "--smoke" in args:
+        return run_smoke()
+    return run_app()
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv); app.setDesktopFileName("currycaster")
-    ar = AudioRouter(); m = MainWindow(ar); m.show(); c = CartWallWindow(ar); c.show(); l = FileExplorerWindow(); l.show()
-    l.file_selected.connect(m.load_auto)
-    ipc_server = IpcServer(m.load_auto)
-    ipc_server.start()
-    sys.exit(app.exec())
+    from multiprocessing import freeze_support
+    freeze_support()
+    sys.exit(main())

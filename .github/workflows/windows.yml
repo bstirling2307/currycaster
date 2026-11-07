@@ -1,0 +1,97 @@
+name: Windows
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install audio libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip python3-gi ffmpeg libportaudio2 \
+            gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-ugly gstreamer1.0-pulseaudio pulseaudio
+      - name: Install Python packages
+        run: |
+          python3 -m venv --system-site-packages .venv
+          . .venv/bin/activate
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+      - name: Start PulseAudio
+        run: |
+          pulseaudio --start --daemonize=true --exit-idle-time=-1 || true
+          for _ in 1 2 3 4 5; do
+            pactl info && exit 0
+            sleep 1
+          done
+          echo "PulseAudio did not start" >&2
+          exit 1
+      - name: Unit tests
+        run: |
+          . .venv/bin/activate
+          python -m pytest -q
+
+  windows-build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install Python packages
+        run: python -m pip install -r requirements-windows.txt -r requirements-dev.txt "pyinstaller>=6.0"
+      - name: Unit tests
+        run: python -m pytest -q
+      - name: Build portable executable
+        run: pyinstaller --noconfirm --clean windows\currycaster.spec
+      - name: Self-check the frozen executable
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          & .\dist\Currycaster\Currycaster.exe --self-check
+          $code = $LASTEXITCODE
+          Write-Host "---- startup.log ----"
+          Get-Content "$env:APPDATA\currycaster\startup.log" -ErrorAction SilentlyContinue
+          Write-Host "---- self-check.txt ----"
+          Get-Content "$env:APPDATA\currycaster\self-check.txt" -ErrorAction SilentlyContinue
+          if ($code -ne 0) { exit $code }
+          $check = Get-Content "$env:APPDATA\currycaster\self-check.txt" -Raw
+          if ($check -notmatch "binding=PySide6") { throw "Expected the frozen app to use PySide6" }
+          if ($check -notmatch "backend=wasapi") { throw "Expected the frozen app to select WASAPI" }
+      - name: Smoke-test the frozen UI offscreen
+        shell: pwsh
+        run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          & .\dist\Currycaster\Currycaster.exe --smoke
+          $code = $LASTEXITCODE
+          Write-Host "---- smoke-result.txt ----"
+          Get-Content "$env:APPDATA\currycaster\smoke-result.txt" -ErrorAction SilentlyContinue
+          Write-Host "---- startup.log ----"
+          Get-Content "$env:APPDATA\currycaster\startup.log" -ErrorAction SilentlyContinue
+          exit $code
+      - name: Build the installer
+        shell: pwsh
+        run: |
+          choco install innosetup --no-progress -y
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            $found = Get-ChildItem "C:\Program Files*" -Recurse -Filter ISCC.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $found) { throw "ISCC.exe was not found after installing Inno Setup" }
+            $iscc = $found.FullName
+          }
+          & $iscc windows\installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package artifacts
+        shell: pwsh
+        run: tar -a -cf dist\Currycaster-windows-x64.zip -C dist Currycaster
+      - uses: actions/upload-artifact@v4
+        with:
+          name: currycaster-windows-x64
+          path: |
+            dist/Currycaster-windows-x64.zip
+            windows/output/Currycaster-Setup.exe
+          if-no-files-found: error
